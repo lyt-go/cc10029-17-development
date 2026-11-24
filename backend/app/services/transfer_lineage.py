@@ -2,6 +2,11 @@
 
 本模块记录每一次数据交换的完整链路信息（源端→窗口→批次→目标端），
 生成血缘链路产物文件，供下游数据追溯和质量审计使用。
+
+同时消费冲突裁决产出的「冲突裁决生效清单」：把每笔已生效裁决的源值、采用值与
+目标端数据范围写入血缘，后续从血缘执行目标合并时只处理实际确认的条目，
+且每笔（记录主键, 冲突字段）只产生一次有效写入；合并结果可回核生效清单的
+采用值、裁决方式与目标运用的字段版本。
 """
 from __future__ import annotations
 
@@ -107,3 +112,120 @@ class TransferLineageService(BaseModuleService):
     def get_active_lineages(self) -> list[dict[str, Any]]:
         """获取所有已生效的血缘链路列表。"""
         return [r for r in store.rows(self.MODULE) if r.get("status") == "已生效"]
+
+    # -- 消费冲突裁决生效清单并驱动目标合并 --
+
+    def consume_effective_list(self, batch_code: str) -> dict[str, Any]:
+        """消费批次的冲突裁决生效清单，把裁决结果写入传输血缘。
+
+        逐笔记录源值、采用值与目标端数据范围（记录主键+字段+字段版本），
+        标记为已确认条目供后续合并使用；已写入过的字段不重复消费。
+        """
+        effective_file = self._data_dir("effective_lists") / f"{batch_code}_effective.jsonl"
+        entries = self._read_jsonl(effective_file)
+        if not entries:
+            return {"batch_code": batch_code, "consumed": 0,
+                    "message": f"批次 {batch_code} 暂无冲突裁决生效清单"}
+
+        lineage_file = self._data_dir("lineage") / f"{batch_code}_adjudication_lineage.jsonl"
+        existing = self._read_jsonl(lineage_file)
+        consumed_keys = {(r.get("record_key"), r.get("field")) for r in existing}
+
+        records = []
+        for entry in entries:
+            field_key = (entry.get("record_key"), entry.get("field"))
+            if field_key in consumed_keys:
+                continue
+            consumed_keys.add(field_key)
+            records.append({
+                "batch_code": batch_code,
+                "conflict_code": entry.get("conflict_code"),
+                "record_key": entry.get("record_key"),
+                "field": entry.get("field"),
+                "source_value": entry.get("source_value"),
+                "adopted_value": entry.get("adopted_value"),
+                "adjudication": entry.get("adjudication"),
+                "field_version": entry.get("field_version"),
+                "target_range": {
+                    "record_key": entry.get("record_key"),
+                    "field": entry.get("field"),
+                    "version": entry.get("field_version"),
+                },
+                "confirmed": True,
+                "consumed_at": time.time(),
+            })
+        if records:
+            self._write_jsonl(lineage_file, records)
+        return {"batch_code": batch_code, "consumed": len(records),
+                "total_confirmed": len(entries)}
+
+    def merge_from_lineage(self, batch_code: str) -> dict[str, Any]:
+        """从血缘执行目标合并：只处理血缘中实际确认的裁决条目。
+
+        每笔（记录主键, 冲突字段）在目标端只产生一次有效写入，
+        重复执行合并不会重复落数。
+        """
+        lineage_file = self._data_dir("lineage") / f"{batch_code}_adjudication_lineage.jsonl"
+        records = self._read_jsonl(lineage_file)
+        confirmed = [r for r in records if r.get("confirmed")]
+        if not confirmed:
+            return {"batch_code": batch_code, "merged": 0,
+                    "message": f"批次 {batch_code} 血缘中没有已确认的裁决条目"}
+
+        merge_file = self._data_dir("lineage_merge") / f"{batch_code}_target_merge.jsonl"
+        applied = self._read_jsonl(merge_file)
+        applied_keys = {(m.get("record_key"), m.get("field")) for m in applied}
+
+        writes = []
+        for record in confirmed:
+            field_key = (record.get("record_key"), record.get("field"))
+            if field_key in applied_keys:
+                continue
+            applied_keys.add(field_key)
+            writes.append({
+                "batch_code": batch_code,
+                "conflict_code": record.get("conflict_code"),
+                "record_key": record.get("record_key"),
+                "field": record.get("field"),
+                "applied_value": record.get("adopted_value"),
+                "applied_version": record.get("field_version"),
+                "adjudication": record.get("adjudication"),
+                "source_value": record.get("source_value"),
+                "target_range": record.get("target_range"),
+                "merged_at": time.time(),
+            })
+        if writes:
+            self._write_jsonl(merge_file, writes)
+        return {"batch_code": batch_code, "merged": len(writes),
+                "skipped": len(confirmed) - len(writes), "writes": writes}
+
+    def verify_effective_merge(self, batch_code: str) -> dict[str, Any]:
+        """按目标合并结果回核冲突裁决生效清单的每一笔。
+
+        逐笔核对采用值、裁决方式与目标运用的字段版本是否一致，
+        输出每笔实际采用的裁决，供确认三笔冲突各自的生效结果。
+        """
+        effective_file = self._data_dir("effective_lists") / f"{batch_code}_effective.jsonl"
+        entries = self._read_jsonl(effective_file)
+        merge_file = self._data_dir("lineage_merge") / f"{batch_code}_target_merge.jsonl"
+        merges = {(m.get("record_key"), m.get("field")): m
+                  for m in self._read_jsonl(merge_file)}
+
+        checks = []
+        for entry in entries:
+            merge = merges.get((entry.get("record_key"), entry.get("field")))
+            checks.append({
+                "conflict_code": entry.get("conflict_code"),
+                "record_key": entry.get("record_key"),
+                "field": entry.get("field"),
+                "adjudication": entry.get("adjudication"),
+                "adopted_value": entry.get("adopted_value"),
+                "applied_value": merge.get("applied_value") if merge else None,
+                "field_version": entry.get("field_version"),
+                "applied_version": merge.get("applied_version") if merge else None,
+                "matched": bool(merge)
+                    and merge.get("applied_value") == entry.get("adopted_value")
+                    and merge.get("applied_version") == entry.get("field_version"),
+            })
+        return {"batch_code": batch_code, "checks": checks,
+                "all_matched": bool(checks) and all(c["matched"] for c in checks)}
